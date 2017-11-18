@@ -27,13 +27,15 @@
     proxy_port = 2223,
     tx_list = gb_trees:empty(),
     cookie_queue = queue:new(),
-    cookie_set = #{}
+    cookie_set = #{},
+    retransmit_time = 200,
+    retransmit_num  = 2
 }).
 
 -define(COOKIE_LEN, 16).
 -define(COOKIE_EXPIRE, 60).
--define(RETRANSMIT_TIME, 1000).
--define(RETRANSMIT_NUM,  2).
+-define(RETRANSMIT_TIME, 300).
+-define(RETRANSMIT_NUM,  3).
 
 %%%===================================================================
 %%% API
@@ -42,21 +44,35 @@ start_link(Name, Args) ->
     gen_server:start_link({local, Name}, ?MODULE, Args, []).
 
 do_command(Name, Args) ->
-    {{dict, Data}, _} = gen_server:call(Name, {do_command, Args}),
-    Data.
+    case gen_server:call(Name, {do_command, Args}) of
+        {{dict, Data}, _} ->
+            Data;
+        {error, Error } ->
+            dict:store(<<"result">>, Error, dict:new())
+    end.
 
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
 init(Args) ->
-    {ok, Socket} = gen_udp:open(0, [binary]),
     IP = proplists:get_value(ip, Args, "127.0.0.1"),
     Port = proplists:get_value(port, Args, 2223),
-    {ok, #state{socket = Socket, proxy_ip = IP, proxy_port = Port}}.
+    UDPOpts = proplists:get_value(udp_opts, Args, [binary, {recbuf,32768}]),
+    RetransmitNum = proplists:get_value(retransmit_num, Args, ?RETRANSMIT_NUM),
+    RetransmitTime = proplists:get_value(retransmit_num, Args, ?RETRANSMIT_TIME),
+    {ok, Socket} = gen_udp:open(0, UDPOpts),
+    {ok, #state{socket = Socket,
+                proxy_ip = IP,
+                proxy_port = Port,
+                retransmit_num = RetransmitNum,
+                retransmit_time = RetransmitTime
+               }}.
 
 handle_call({do_command, Args} = Command, From, #state{socket = Socket, proxy_ip = IP, proxy_port = Port} = State) ->
+    #state{ retransmit_time = RetransmitTime,
+            retransmit_num  = RetransmitNum } = State,
     {Cookie,State1} = cookie(State),
-    TimerRef = erlang:start_timer(?RETRANSMIT_TIME, self(), { retransmit, Cookie, Command, From, ?RETRANSMIT_NUM } ),
+    TimerRef = erlang:start_timer(RetransmitTime, self(), { retransmit, Cookie, Command, From, RetransmitNum } ),
     Data = bencode(Args),
     gen_udp:send(Socket, IP, Port, <<Cookie/binary, " ", Data/binary>>),
     {noreply, State1#state{tx_list = gb_trees:enter(Cookie, {From, TimerRef}, tx_list(State1))}};
@@ -71,7 +87,7 @@ handle_cast(_Msg, State) ->
 handle_info({udp, _, _, _, <<Cookie:?COOKIE_LEN/binary, " ", Data/binary>>}, State) ->
     case gb_trees:lookup(Cookie, tx_list(State)) of
         none ->
-            error_logger:error_msg("Not found tx for: ~p ~p", [Cookie, Data]);
+            ok;
         {value, {From, TimerRef}} ->
             erlang:cancel_timer(TimerRef, [ {async, true}, {info, false} ]),
             gen_server:reply(From, bencode:decode(Data))
